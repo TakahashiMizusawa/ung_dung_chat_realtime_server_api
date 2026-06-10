@@ -159,7 +159,7 @@ app.put('/api/users/update', async (req, res) => {
 
 // 6. API TÌM KIẾM NGƯỜI DÙNG BẰNG QUERY PARAMETER
 app.get('/api/users/search', async (req, res) => {
-    const keyword = req.query.q; // Hứng từ khóa q từ Flutter truyền sang
+    const keyword = req.query.q; 
     
     if (!keyword) {
         return res.status(400).json({ success: false, message: 'Thiếu từ khóa tìm kiếm!' });
@@ -191,7 +191,6 @@ app.post('/api/friends/send-request', async (req, res) => {
     }
 
     try {
-        // Kiểm tra xem đã kết bạn hoặc gửi lời mời trước đó chưa
         const checkRequest = await pool.query(
             `SELECT * FROM public.friendships 
              WHERE (sender_id = $1 AND receiver_id = $2) 
@@ -207,7 +206,6 @@ app.post('/api/friends/send-request', async (req, res) => {
             return res.json({ success: false, message: 'Lời mời đang chờ phản hồi hoặc đã được gửi!' });
         }
 
-        // Tạo bản ghi lời mời kết bạn mới trạng thái pending
         await pool.query(
             `INSERT INTO public.friendships (sender_id, receiver_id, status) 
              VALUES ($1, $2, 'pending')`,
@@ -278,6 +276,32 @@ app.get('/api/friends/list/:userId', async (req, res) => {
     }
 });
 
+// ==================== CÁC API QUẢN LÝ TIN NHẮN (MESSAGE ENDPOINTS) ====================
+
+// 11. API LẤY LỊCH SỬ TIN NHẮN GIỮA HAI NGƯỜI DÙNG (Mới bổ sung)
+app.get('/api/messages/history', async (req, res) => {
+    const { sender_id, receiver_id } = req.query;
+
+    if (!sender_id || !receiver_id) {
+        return res.status(400).json({ success: false, message: 'Thiếu thông tin người gửi hoặc nhận!' });
+    }
+
+    try {
+        const queryText = `
+            SELECT id, sender_id, receiver_id, message_text AS text, created_at AS time
+            FROM public.messages
+            WHERE (sender_id = $1 AND receiver_id = $2)
+               OR (sender_id = $2 AND receiver_id = $1)
+            ORDER BY created_at ASC
+        `;
+        const result = await pool.query(queryText, [sender_id, receiver_id]);
+        res.json({ success: true, messages: result.rows });
+    } catch (err) {
+        console.error('❌ Lỗi lấy lịch sử tin nhắn từ DB:', err);
+        res.status(500).json({ success: false, message: 'Lỗi hệ thống khi tải tin nhắn!' });
+    }
+});
+
 // ==================== CẤU HÌNH SOCKET.IO TRUYỀN TIN REALTIME ====================
 
 const onlineUsers = {};
@@ -290,16 +314,31 @@ io.on('connection', (socket) => {
         console.log(`👤 Người dùng [ID: ${userId}] đã online với SocketID: ${socket.id}`);
     });
 
+    // Xử lý gửi tin nhắn Realtime và tự động Lưu vào Database
     socket.on('send_message', async (data) => {
         const { sender_id, receiver_id, text, time } = data;
-        const receiverSocketId = onlineUsers[receiver_id];
-        if (receiverSocketId) {
-            io.to(receiverSocketId).emit('receive_message', {
-                sender_id: sender_id,
-                text: text,
-                time: time
-            });
-            console.log(`✉️ Đã chuyển tiếp tin nhắn từ ${sender_id} đến ${receiver_id}`);
+        
+        try {
+            // Lưu tin nhắn vào cơ sở dữ liệu trước
+            const queryInsert = `
+                INSERT INTO public.messages (sender_id, receiver_id, message_text) 
+                VALUES ($1, $2, $3) RETURNING id
+            `;
+            const result = await pool.query(queryInsert, [sender_id, receiver_id, text]);
+            console.log(`💾 Đã lưu tin nhắn vào DB thành công (Msg ID: ${result.rows[0].id})`);
+
+            // Tiến hành chuyển tiếp tin nhắn realtime qua Socket nếu đối phương đang online
+            const receiverSocketId = onlineUsers[receiver_id];
+            if (receiverSocketId) {
+                io.to(receiverSocketId).emit('receive_message', {
+                    sender_id: sender_id,
+                    text: text,
+                    time: time
+                });
+                console.log(`✉️ Đã chuyển tiếp tin nhắn qua Socket từ ${sender_id} tới ${receiver_id}`);
+            }
+        } catch (dbErr) {
+            console.error('❌ Lỗi ghi nhận/gửi tin nhắn:', dbErr);
         }
     });
 
