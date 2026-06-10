@@ -157,8 +157,7 @@ app.put('/api/users/update', async (req, res) => {
     }
 });
 
-// ⭐ 6. API TÌM KIẾM NGƯỜI DÙNG BẰNG QUERY PARAMETER (MỚI BỔ SUNG) ⭐
-// Endpoint này xử lý dạng: /api/users/search?q=từ_khóa
+// 6. API TÌM KIẾM NGƯỜI DÙNG BẰNG QUERY PARAMETER
 app.get('/api/users/search', async (req, res) => {
     const keyword = req.query.q; // Hứng từ khóa q từ Flutter truyền sang
     
@@ -167,7 +166,6 @@ app.get('/api/users/search', async (req, res) => {
     }
 
     try {
-        // Tìm kiếm không phân biệt hoa thường theo username hoặc email trong public.users
         const queryText = `
             SELECT id, username, email, avatar_url 
             FROM public.users 
@@ -182,26 +180,118 @@ app.get('/api/users/search', async (req, res) => {
     }
 });
 
+// ==================== CÁC API QUẢN LÝ BẠN BÈ (FRIEND ENDPOINTS) ====================
+
+// 7. API GỬI LỜI MỜI KẾT BẠN
+app.post('/api/friends/send-request', async (req, res) => {
+    const { sender_id, receiver_id } = req.body;
+
+    if (!sender_id || !receiver_id) {
+        return res.status(400).json({ success: false, message: 'Thiếu thông tin người gửi hoặc người nhận!' });
+    }
+
+    try {
+        // Kiểm tra xem đã kết bạn hoặc gửi lời mời trước đó chưa
+        const checkRequest = await pool.query(
+            `SELECT * FROM public.friendships 
+             WHERE (sender_id = $1 AND receiver_id = $2) 
+                OR (sender_id = $2 AND receiver_id = $1)`,
+            [sender_id, receiver_id]
+        );
+
+        if (checkRequest.rows.length > 0) {
+            const status = checkRequest.rows[0].status;
+            if (status === 'accepted') {
+                return res.json({ success: false, message: 'Hai người đã là bạn bè rồi!' });
+            }
+            return res.json({ success: false, message: 'Lời mời đang chờ phản hồi hoặc đã được gửi!' });
+        }
+
+        // Tạo bản ghi lời mời kết bạn mới trạng thái pending
+        await pool.query(
+            `INSERT INTO public.friendships (sender_id, receiver_id, status) 
+             VALUES ($1, $2, 'pending')`,
+            [sender_id, receiver_id]
+        );
+
+        res.json({ success: true, message: 'Đã gửi lời mời kết bạn thành công!' });
+    } catch (err) {
+        console.error('❌ Lỗi gửi lời mời kết bạn:', err);
+        res.status(500).json({ success: false, message: 'Lỗi hệ thống!' });
+    }
+});
+
+// 8. API LẤY DANH SÁCH LỜI MỜI KẾT BẠN ĐANG CHỜ
+app.get('/api/friends/requests/:userId', async (req, res) => {
+    const { userId } = req.params;
+    try {
+        const queryText = `
+            SELECT f.id, f.sender_id, u.username AS sender_username, u.email AS sender_email, u.avatar_url
+            FROM public.friendships f
+            JOIN public.users u ON f.sender_id = u.id
+            WHERE f.receiver_id = $1 AND f.status = 'pending'
+        `;
+        const result = await pool.query(queryText, [userId]);
+        res.json({ success: true, requests: result.rows });
+    } catch (err) {
+        console.error('❌ Lỗi lấy danh sách lời mời:', err);
+        res.status(500).json({ success: false, message: 'Lỗi hệ thống!' });
+    }
+});
+
+// 9. API PHẢN HỒI LỜI MỜI KẾT BẠN (Chấp nhận / Từ chối)
+app.post('/api/friends/respond-request', async (req, res) => {
+    const { request_id, action } = req.body;
+    try {
+        if (action === 'accept') {
+            await pool.query(
+                "UPDATE public.friendships SET status = 'accepted' WHERE id = $1",
+                [request_id]
+            );
+            res.json({ success: true, message: 'Đã đồng ý kết bạn!' });
+        } else {
+            await pool.query("DELETE FROM public.friendships WHERE id = $1", [request_id]);
+            res.json({ success: true, message: 'Đã hủy lời mời kết bạn!' });
+        }
+    } catch (err) {
+        console.error('❌ Lỗi phản hồi lời mời kết bạn:', err);
+        res.status(500).json({ success: false, message: 'Lỗi hệ thống!' });
+    }
+});
+
+// 10. API LẤY DANH SÁCH BẠN BÈ
+app.get('/api/friends/list/:userId', async (req, res) => {
+    const { userId } = req.params;
+    try {
+        const queryText = `
+            SELECT u.id, u.username, u.email, u.avatar_url
+            FROM public.friendships f
+            JOIN public.users u ON (f.sender_id = u.id AND f.receiver_id = $1) 
+                               OR (f.receiver_id = u.id AND f.sender_id = $1)
+            WHERE (f.sender_id = $1 OR f.receiver_id = $1) AND f.status = 'accepted'
+        `;
+        const result = await pool.query(queryText, [userId]);
+        res.json({ success: true, friends: result.rows });
+    } catch (err) {
+        console.error('❌ Lỗi lấy danh sách bạn bè:', err);
+        res.status(500).json({ success: false, message: 'Lỗi hệ thống!' });
+    }
+});
 
 // ==================== CẤU HÌNH SOCKET.IO TRUYỀN TIN REALTIME ====================
 
-// Object lưu trữ danh sách thiết bị online dạng: { userId: socketId }
 const onlineUsers = {};
 
 io.on('connection', (socket) => {
     console.log(`🔌 Thiết bị kết nối mới: ${socket.id}`);
 
-    // Đăng ký định danh thiết bị khi đăng nhập thành công
     socket.on('register_user', (userId) => {
         onlineUsers[userId] = socket.id;
         console.log(`👤 Người dùng [ID: ${userId}] đã online với SocketID: ${socket.id}`);
     });
 
-    // Xử lý gửi tin nhắn Realtime (Đồng bộ với Flutter ChatScreen)
     socket.on('send_message', async (data) => {
         const { sender_id, receiver_id, text, time } = data;
-        
-        // Gửi trực tiếp tin nhắn đến SocketID của người nhận nếu họ online
         const receiverSocketId = onlineUsers[receiver_id];
         if (receiverSocketId) {
             io.to(receiverSocketId).emit('receive_message', {
@@ -213,10 +303,8 @@ io.on('connection', (socket) => {
         }
     });
 
-    // Xử lý gửi lời mời kết bạn Realtime (Đồng bộ với Flutter SearchScreen)
     socket.on('send_friend_request', (data) => {
         const { sender_id, sender_username, receiver_id } = data;
-        
         const receiverSocketId = onlineUsers[receiver_id];
         if (receiverSocketId) {
             io.to(receiverSocketId).emit('new_friend_request', {
@@ -228,7 +316,6 @@ io.on('connection', (socket) => {
     });
 
     socket.on('disconnect', () => {
-        // Xóa thiết bị khỏi danh sách online khi ngắt kết nối
         for (const userId in onlineUsers) {
             if (onlineUsers[userId] === socket.id) {
                 delete onlineUsers[userId];
